@@ -250,7 +250,6 @@ func (el *AwaitElection) createSessionAndElection(ctx context.Context) error {
 func (el *AwaitElection) Run() error {
 	for {
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 
 		// Initialize session and election
 		err := el.createSessionAndElection(ctx)
@@ -274,6 +273,8 @@ func (el *AwaitElection) Run() error {
 				err = el.LeaderExec(ctx)
 				if err != nil {
 					log.Printf("Leader execution error: %v", err)
+					cancel()
+					return err
 				}
 				return err
 			} else {
@@ -281,7 +282,6 @@ func (el *AwaitElection) Run() error {
 			}
 		} else {
 			log.Printf("Failed to get current leader: %v, will campaign.", err)
-			// Continue with campaigning
 		}
 
 		err = el.Election.Campaign(ctx, el.LeaderIdentity)
@@ -297,6 +297,8 @@ func (el *AwaitElection) Run() error {
 		err = el.LeaderExec(ctx)
 		if err != nil {
 			log.Printf("Leader execution error: %v", err)
+			cancel()
+			return err
 		}
 
 		select {
@@ -306,7 +308,6 @@ func (el *AwaitElection) Run() error {
 			log.Printf("Session expired or lost, losing leadership")
 			cancel()
 			time.Sleep(el.RetryPeriod)
-			// Starting new election cycle
 		}
 	}
 }
