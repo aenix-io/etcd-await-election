@@ -17,18 +17,17 @@ Set `etcd-await-election` as your command's entry point in the container or exec
 
 The relevant environment variables are:
 
-| Variable                          | Description |
+ Variable                          | Description |
 |-----------------------------------|-------------|
 | `ETCD_AWAIT_ELECTION_LOCK_NAME`   | Name of the lock within etcd used for the election process. |
 | `ETCD_AWAIT_ELECTION_IDENTITY`    | Unique identity for the instance competing for leadership. Typically set to the pod's name. |
-| `ETCD_AWAIT_ELECTION_STATUS_ENDPOINT` | Optional: HTTP endpoint to report leadership status. |
-| `ETCD_AWAIT_ELECTION_LEASE_DURATION` | Optional: Lease duration (seconds) before a leader must renew. Default: 15. |
-| `ETCD_AWAIT_ELECTION_RENEW_DEADLINE` | Optional: Time limit (seconds) for the leader to renew the lease. Default: 10. |
-| `ETCD_AWAIT_ELECTION_RETRY_PERIOD` | Optional: Time interval (seconds) to retry a failed election. Default: 2. |
+| `ETCD_AWAIT_ELECTION_STATUS_ENDPOINT` | HTTP endpoint to report leadership status, formatted as `host:port` (e.g., `127.0.0.1:1234`). Optional: If not set, no status will be reported. |
+| `ETCD_AWAIT_ELECTION_LEASE_DURATION` | Lease duration (seconds) before a leader must renew. Optional: Default is 15 seconds. |
+| `ETCD_AWAIT_ELECTION_RENEW_DEADLINE` | Time limit (seconds) for the leader to renew the lease. Optional: Default is 10 seconds. |
+| `ETCD_AWAIT_ELECTION_RETRY_PERIOD` | Time interval (seconds) to retry a failed election. Optional: Default is 2 seconds. |
 | `ETCD_AWAIT_ELECTION_ENDPOINTS` | Comma-separated list of etcd endpoints. |
 | `ETCD_AWAIT_ELECTION_CERT`, `ETCD_AWAIT_ELECTION_KEY`, `ETCD_AWAIT_ELECTION_CACERT` | TLS certificates for secure communication with etcd. |
-| `ETCD_AWAIT_ELECTION_FORCE_ACQUIRE` | Optional: Set to any non-empty value to forcefully acquire leadership by deleting existing locks. Only one instance should run with this option. |
-
+| `ETCD_AWAIT_ELECTION_FORCE_ACQUIRE` | Set to any non-empty value to forcefully acquire leadership by deleting existing locks. Optional: Use with caution as only one instance should run with this option. |
 
 ### Installation
 
@@ -45,6 +44,7 @@ ETCD_AWAIT_ELECTION_KEY=/etc/etcd/pki/etcdctl-etcd-client.key \
 ETCD_AWAIT_ELECTION_ENDPOINTS='https://127.0.0.1:2379' \
 ETCD_AWAIT_ELECTION_LOCK_NAME=test \
 ETCD_AWAIT_ELECTION_IDENTITY=$HOSTNAME \
+ETCD_AWAIT_ELECTION_STATUS_ENDPOINT=127.0.0.1:1234 \
 etcd-await-election sleep 100m
 ```
 

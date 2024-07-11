@@ -258,6 +258,9 @@ func (el *AwaitElection) Run() error {
 			return err
 		}
 
+		// Start the status endpoint to serve HTTP requests
+		el.startStatusEndpoint(ctx)
+
 		go el.keepLeaseAlive(ctx)
 
 		// Check current leader immediately
@@ -353,6 +356,7 @@ func (el *AwaitElection) monitorLeadership(ctx context.Context, cancel context.C
 
 func (el *AwaitElection) startStatusEndpoint(ctx context.Context) {
 	if el.StatusEndpoint == "" {
+		log.Printf("Status endpoint not configured")
 		return
 	}
 
@@ -360,10 +364,12 @@ func (el *AwaitElection) startStatusEndpoint(ctx context.Context) {
 	serveMux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		leaderResp, err := el.Election.Leader(ctx)
 		if err != nil || string(leaderResp.Kvs[0].Value) != el.LeaderIdentity {
-			http.Error(writer, "Not leader", http.StatusServiceUnavailable)
+			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"awaiting\"}\n"))
 			return
 		}
-		writer.Write([]byte("{\"status\": \"ok\"}"))
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"running\"}\n"))
 	})
 
 	statusServer := http.Server{
@@ -373,8 +379,12 @@ func (el *AwaitElection) startStatusEndpoint(ctx context.Context) {
 			return ctx
 		},
 	}
+
 	go func() {
-		_ = statusServer.ListenAndServe()
+		log.Printf("Starting status endpoint on %s", el.StatusEndpoint)
+		if err := statusServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Failed to start status server: %v", err)
+		}
 	}()
 }
 
