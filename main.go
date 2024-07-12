@@ -13,10 +13,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 type ConfigError struct {
@@ -32,14 +32,12 @@ type AwaitElection struct {
 	LeaderIdentity string
 	StatusEndpoint string
 	LeaseDuration  time.Duration
-	RenewDeadline  time.Duration
 	RetryPeriod    time.Duration
 	LeaderExec     func(ctx context.Context) error
 	EtcdClient     *clientv3.Client
-	Election       *concurrency.Election
-	Session        *concurrency.Session
 	leaseID        clientv3.LeaseID
 	ForceAcquire   bool
+	currentLeader  string
 }
 
 func NewAwaitElectionConfig(exec func(ctx context.Context) error) (*AwaitElection, error) {
@@ -60,14 +58,6 @@ func NewAwaitElectionConfig(exec func(ctx context.Context) error) (*AwaitElectio
 		d, err := strconv.Atoi(val)
 		if err == nil {
 			leaseDuration = time.Duration(d) * time.Second
-		}
-	}
-
-	renewDeadline := 10 * time.Second
-	if val, ok := os.LookupEnv("ETCD_AWAIT_ELECTION_RENEW_DEADLINE"); ok {
-		d, err := strconv.Atoi(val)
-		if err == nil {
-			renewDeadline = time.Duration(d) * time.Second
 		}
 	}
 
@@ -109,7 +99,6 @@ func NewAwaitElectionConfig(exec func(ctx context.Context) error) (*AwaitElectio
 		LeaderIdentity: leaderIdentity,
 		StatusEndpoint: statusEndpoint,
 		LeaseDuration:  leaseDuration,
-		RenewDeadline:  renewDeadline,
 		RetryPeriod:    retryPeriod,
 		LeaderExec:     exec,
 		EtcdClient:     etcdClient,
@@ -147,76 +136,46 @@ func getTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func (el *AwaitElection) writeLeaseID(ctx context.Context, leaseID clientv3.LeaseID) error {
-	_, err := el.EtcdClient.Put(ctx, el.LockName+"/leaseID", fmt.Sprintf("%d", leaseID))
-	return err
-}
-
-func (el *AwaitElection) readLeaseID(ctx context.Context) (clientv3.LeaseID, error) {
-	resp, err := el.EtcdClient.Get(ctx, el.LockName+"/leaseID")
-	if err != nil {
-		return 0, err
-	}
-	if len(resp.Kvs) == 0 {
-		return 0, fmt.Errorf("no leaseID found")
-	}
-	leaseID, err := strconv.ParseInt(string(resp.Kvs[0].Value), 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return clientv3.LeaseID(leaseID), nil
-}
-
-func (el *AwaitElection) createOrRestoreSession(ctx context.Context) error {
-	storedLeaseID, err := el.readLeaseID(ctx)
-	if err == nil && storedLeaseID != 0 {
-		// Attempt to verify existing lease
-		_, err := el.EtcdClient.TimeToLive(ctx, storedLeaseID)
-		if err == nil {
-			el.leaseID = storedLeaseID
-			session, err := concurrency.NewSession(el.EtcdClient, concurrency.WithLease(storedLeaseID))
-			if err == nil {
-				el.Session = session
-				return nil
-			}
-		}
-	}
-	// Recreate new lease on any errors
-	return el.createAndSaveNewLease(ctx)
-}
-
 func (el *AwaitElection) createAndSaveNewLease(ctx context.Context) error {
 	lease, err := el.EtcdClient.Grant(ctx, int64(el.LeaseDuration.Seconds()))
 	if err != nil {
 		return fmt.Errorf("failed to create lease: %v", err)
 	}
 	el.leaseID = lease.ID
-	session, err := concurrency.NewSession(el.EtcdClient, concurrency.WithLease(lease.ID))
-	if err != nil {
-		return fmt.Errorf("failed to create session: %v", err)
-	}
-	el.Session = session
-	err = el.writeLeaseID(ctx, lease.ID)
-	if err != nil {
-		return fmt.Errorf("failed to write leaseID: %v", err)
-	}
 	return nil
 }
 
-func (el *AwaitElection) keepLeaseAlive(ctx context.Context) {
+func (el *AwaitElection) keepLeaseAlive(ctx context.Context, cancel context.CancelFunc) {
 	ch, kaerr := el.EtcdClient.KeepAlive(ctx, el.leaseID)
 	if kaerr != nil {
 		log.Printf("Failed to set up lease keep-alive: %v", kaerr)
+		cancel()            // Immediately cancel context if setting up keep-alive fails
 		el.revokeLease(ctx) // Immediately try to revoke lease if setting up keep-alive fails
 		return
 	}
-	for kaResp := range ch {
-		if kaResp == nil {
-			log.Printf("Lease keep-alive response is nil, lease might be lost")
-			el.revokeLease(ctx) // Revoke lease immediately if keep-alive fails
+	for {
+		select {
+		case kaResp, ok := <-ch:
+			if !ok || kaResp == nil {
+				log.Printf("Lease keep-alive channel closed or response is nil, lease might be lost")
+				cancel()            // Cancel context if keep-alive fails
+				el.revokeLease(ctx) // Revoke lease immediately if keep-alive fails
+				return
+			}
+		case <-time.After(el.RetryPeriod):
+			healthCtx, healthCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer healthCancel()
+			_, err := el.EtcdClient.Get(healthCtx, "health")
+			if err != nil {
+				log.Printf("Failed to get etcd health: %v", err)
+				cancel()
+				el.revokeLease(ctx)
+				return
+			}
+		case <-ctx.Done():
+			log.Printf("Context canceled, stopping lease keep-alive")
 			return
 		}
-		log.Printf("Lease keep-alive received: ID=%v, TTL=%v", kaResp.ID, kaResp.TTL)
 	}
 }
 
@@ -228,129 +187,135 @@ func (el *AwaitElection) revokeLease(ctx context.Context) {
 	}
 }
 
-func (el *AwaitElection) createSessionAndElection(ctx context.Context) error {
-	if el.ForceAcquire {
-		_, err := el.EtcdClient.Delete(ctx, el.LockName, clientv3.WithPrefix())
-		if err != nil {
-			log.Printf("Failed to delete existing locks with prefix %s: %v", el.LockName, err)
-			return err
+func (el *AwaitElection) watchLeadership(ctx context.Context, cancel context.CancelFunc) {
+	watchChan := el.EtcdClient.Watch(ctx, el.LockName)
+	for watchResp := range watchChan {
+		for _, ev := range watchResp.Events {
+			if ev.Type == clientv3.EventTypeDelete {
+				log.Printf("Leadership key deleted, cancelling leadership")
+				cancel()
+				return
+			}
 		}
-		log.Printf("Existing locks with prefix %s deleted successfully under force acquire policy", el.LockName)
 	}
+}
 
-	session, err := concurrency.NewSession(el.EtcdClient)
-	if err != nil {
-		return fmt.Errorf("failed to create session: %v", err)
+func (el *AwaitElection) acquireLeadership(ctx context.Context) error {
+	for {
+		if el.ForceAcquire {
+			// Delete the existing lock if force acquire is enabled
+			_, err := el.EtcdClient.Delete(ctx, el.LockName)
+			if err != nil {
+				log.Printf("Failed to delete existing lock: %v", err)
+			} else {
+				log.Printf("Existing lock deleted under force acquire policy")
+			}
+		} else {
+			resp, err := el.EtcdClient.Get(ctx, el.LockName)
+			if err != nil {
+				return fmt.Errorf("failed to get current leader: %v", err)
+			}
+
+			if len(resp.Kvs) > 0 && string(resp.Kvs[0].Value) == el.LeaderIdentity {
+				// Current node is already the leader, delete the existing lock to reacquire it
+				_, err := el.EtcdClient.Delete(ctx, el.LockName)
+				if err != nil {
+					log.Printf("Failed to delete existing lock: %v", err)
+				} else {
+					log.Printf("Existing lock owned by current node deleted to reacquire it")
+				}
+			}
+		}
+
+		lease, err := el.EtcdClient.Grant(ctx, int64(el.LeaseDuration.Seconds()))
+		if err != nil {
+			return fmt.Errorf("failed to create lease: %v", err)
+		}
+		el.leaseID = lease.ID
+
+		txn := el.EtcdClient.Txn(ctx).If(
+			clientv3.Compare(clientv3.CreateRevision(el.LockName), "=", 0),
+		).Then(
+			clientv3.OpPut(el.LockName, el.LeaderIdentity, clientv3.WithLease(lease.ID)),
+		).Else(
+			clientv3.OpGet(el.LockName),
+		)
+
+		txnResp, err := txn.Commit()
+		if err != nil {
+			return fmt.Errorf("failed to commit transaction: %v", err)
+		}
+
+		if txnResp.Succeeded {
+			// Leadership acquired
+			el.currentLeader = el.LeaderIdentity
+			log.Printf("Leadership acquired by %s", el.LeaderIdentity)
+			return nil
+		}
+
+		// There's a current leader, check who it is
+		resp, err := el.EtcdClient.Get(ctx, el.LockName)
+		if err != nil {
+			return fmt.Errorf("failed to get current leader: %v", err)
+		}
+
+		currentLeader := string(resp.Kvs[0].Value)
+		if currentLeader != el.currentLeader {
+			el.currentLeader = currentLeader
+			log.Printf("Current leader is %s, will continue trying", currentLeader)
+		}
+
+		// Wait and retry
+		time.Sleep(el.RetryPeriod)
 	}
-	el.Session = session
-	el.Election = concurrency.NewElection(session, el.LockName)
-	return nil
 }
 
 func (el *AwaitElection) Run() error {
 	for {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		// Initialize session and election
-		err := el.createSessionAndElection(ctx)
-		if err != nil {
-			log.Fatalf("Failed to initialize session or election: %v", err)
-			return err
-		}
+		mainCtx, cancel := context.WithCancel(context.Background())
 
 		// Start the status endpoint to serve HTTP requests
-		el.startStatusEndpoint(ctx)
+		el.startStatusEndpoint(mainCtx)
 
-		go el.keepLeaseAlive(ctx)
-
-		// Check current leader immediately
-		resp, err := el.Election.Leader(ctx)
-		if err == nil {
-			currentLeader := string(resp.Kvs[0].Value)
-			log.Printf("Current leader is %s", currentLeader)
-
-			if currentLeader == el.LeaderIdentity {
-				log.Printf("Leader identity matches, continuing leadership.")
-				log.Printf("Long live our new leader: %s", el.LeaderIdentity)
-				go el.monitorLeadership(ctx, cancel)
-				err = el.LeaderExec(ctx)
-				if err != nil {
-					log.Printf("Leader execution error: %v", err)
-					cancel()
-					return err
-				}
-				return err
-			} else {
-				log.Printf("Current leader is %s, not %s, will continue trying.", currentLeader, el.LeaderIdentity)
-			}
-		} else {
-			log.Printf("Failed to get current leader: %v, will campaign.", err)
-		}
-
-		err = el.Election.Campaign(ctx, el.LeaderIdentity)
+		// Attempt to acquire leadership
+		err := el.acquireLeadership(mainCtx)
 		if err != nil {
-			log.Printf("Failed to campaign for leadership: %v, retrying...", err)
-			time.Sleep(el.RetryPeriod)
-			continue
-		}
-
-		log.Printf("Long live our new leader: %s", el.LeaderIdentity)
-		go el.monitorLeadership(ctx, cancel)
-
-		err = el.LeaderExec(ctx)
-		if err != nil {
-			log.Printf("Leader execution error: %v", err)
+			log.Fatalf("Failed to acquire leadership: %v", err)
 			cancel()
 			return err
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-el.Session.Done():
-			log.Printf("Session expired or lost, losing leadership")
-			cancel()
-			time.Sleep(el.RetryPeriod)
-		}
-	}
-}
+		// Keep lease alive in a separate goroutine
+		go el.keepLeaseAlive(mainCtx, cancel)
 
-func (el *AwaitElection) monitorLeaseKeepAlive(ctx context.Context, ch <-chan *clientv3.LeaseKeepAliveResponse) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case kaResp, ok := <-ch:
-			if !ok {
-				log.Printf("Lease keep-alive channel closed, losing leadership")
-				return
-			}
-			if kaResp == nil {
-				log.Printf("Lease keep-alive response is nil, losing leadership")
-				return
-			}
-		}
-	}
-}
+		// Monitor leadership status in a separate goroutine
+		go el.watchLeadership(mainCtx, cancel)
 
-func (el *AwaitElection) monitorLeadership(ctx context.Context, cancel context.CancelFunc) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(el.RetryPeriod):
-			resp, err := el.Election.Leader(ctx)
-			if err != nil {
-				log.Printf("Lost leadership or error checking leader: %v", err)
-				cancel()
-				return
-			}
-			if string(resp.Kvs[0].Value) != el.LeaderIdentity {
-				log.Printf("Lost leadership to %s, exiting", string(resp.Kvs[0].Value))
-				cancel()
-				return
+		// Execute the leader function
+		err = el.LeaderExec(mainCtx)
+		if err != nil {
+			log.Printf("Leader execution error: %v", err)
+		}
+
+		// Regardless of the command result, prepare to cancel context
+		cancel()
+
+		// Use a separate context for lease revocation to ensure it can complete
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer revokeCancel()
+		el.revokeLease(revokeCtx)
+
+		// Retrieve exit code if the command failed
+		exitCode := 0
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				exitCode = status.ExitStatus()
 			}
 		}
+
+		// Log and exit with the command's exit status
+		log.Printf("Exiting process with code %d", exitCode)
+		syscall.Exit(exitCode)
 	}
 }
 
@@ -362,14 +327,18 @@ func (el *AwaitElection) startStatusEndpoint(ctx context.Context) {
 
 	serveMux := http.NewServeMux()
 	serveMux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		leaderResp, err := el.Election.Leader(ctx)
-		if err != nil || string(leaderResp.Kvs[0].Value) != el.LeaderIdentity {
+		resp, err := el.EtcdClient.Get(ctx, el.LockName)
+		if err != nil || len(resp.Kvs) == 0 {
 			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"awaiting\"}\n"))
 			return
 		}
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusOK)
-		writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"running\"}\n"))
+		if string(resp.Kvs[0].Value) == el.LeaderIdentity {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusOK)
+			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"running\"}\n"))
+		} else {
+			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"awaiting\"}\n"))
+		}
 	})
 
 	statusServer := http.Server{
