@@ -329,15 +329,21 @@ func (el *AwaitElection) startStatusEndpoint(ctx context.Context) {
 	serveMux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		resp, err := el.EtcdClient.Get(ctx, el.LockName)
 		if err != nil || len(resp.Kvs) == 0 {
-			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"awaiting\"}\n"))
+			writer.Header().Set("Content-Type", "text/plain")
+			writer.WriteHeader(http.StatusOK)
+			writer.Write([]byte(fmt.Sprintf("{\"status\": \"ok\", \"phase\": \"awaiting\", \"leader\": \"unknown\"}\n")))
 			return
 		}
-		if string(resp.Kvs[0].Value) == el.LeaderIdentity {
+
+		currentLeader := string(resp.Kvs[0].Value)
+		if currentLeader == el.LeaderIdentity {
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusOK)
-			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"running\"}\n"))
+			writer.Write([]byte(fmt.Sprintf("{\"status\": \"ok\", \"phase\": \"running\", \"leader\": \"%s\"}\n", currentLeader)))
 		} else {
-			writer.Write([]byte("{\"status\": \"ok\", \"phase\": \"awaiting\"}\n"))
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusOK)
+			writer.Write([]byte(fmt.Sprintf("{\"status\": \"ok\", \"phase\": \"awaiting\", \"leader\": \"%s\"}\n", currentLeader)))
 		}
 	})
 
