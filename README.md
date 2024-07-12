@@ -20,7 +20,7 @@ The relevant environment variables are:
  Variable                          | Description |
 |-----------------------------------|-------------|
 | `ETCD_AWAIT_ELECTION_LOCK_NAME`   | Name of the lock within etcd used for the election process. |
-| `ETCD_AWAIT_ELECTION_IDENTITY`    | Unique identity for the instance competing for leadership. Typically set to the pod's name. |
+| `ETCD_AWAIT_ELECTION_IDENTITY`    | Unique identity for the instance competing for leadership. Typically set to the host's name. |
 | `ETCD_AWAIT_ELECTION_STATUS_ENDPOINT` | HTTP endpoint to report leadership status, formatted as `host:port` (e.g., `127.0.0.1:1234`). Optional: If not set, no status will be reported. |
 | `ETCD_AWAIT_ELECTION_LEASE_DURATION` | Lease duration (seconds) before a leader must renew. Optional: Default is 15 seconds. |
 | `ETCD_AWAIT_ELECTION_RENEW_DEADLINE` | Time limit (seconds) for the leader to renew the lease. Optional: Default is 10 seconds. |
@@ -32,6 +32,8 @@ The relevant environment variables are:
 ### Installation
 
 Binaries can be downloaded from the [releases page](https://github.com/aenix-io/etcd-await-election/releases).
+
+If you're looking for a way to bootstrap a etcd cluster, consider using the [etcdadm](https://github.com/kubernetes-sigs/etcdadm) project, which simplifies the setup process.
 
 ### Example Configuration
 
@@ -49,3 +51,16 @@ etcd-await-election sleep 100m
 ```
 
 This command sets up the required TLS configuration, specifies the `etcd` endpoints, and defines the lock name and identity before running a `sleep` command under the `etcd-await-election` system for 100 minutes, assuming leadership has been acquired.
+
+
+### Differences from `etcdctl lock`
+
+Official `etcdctl` tool has it's own implementation for locks.
+The differences from using a simple `etcdctl lock` are:
+
+1. **Continuous Lock Renewal**: The lock is continuously renewed. If the lock cannot be renewed (e.g., due to a lost connection to etcd), the process will terminate immediately.
+1. **Preemptible Locks**: The lock can be preempted. You can configure a primary node with priority lock acquisition and secondary nodes that monitor the lock. If another instance acquires the lock, the process will be stopped.
+1. **Seamless Lock Takeover**: If the etcd-await-election process is restarted within the active lock duration, the existing lock will be taken over, and other followers will not preempt the lock.
+1. **HTTP Status Endpoint**: A simple HTTP server is available to check the status: whether the process is running, whether it is the leader, and who the leader is.
+
+Overall, while `etcdctl lock` is suitable for managing the concurrent execution of short-lived commands, `etcd-await-election` performs full-fledged leader election and is designed for running long-lived processes.
